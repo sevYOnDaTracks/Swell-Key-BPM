@@ -19,11 +19,18 @@ struct Key
     float score = 0.0f;
     juce::String name() const { return juce::String (noteNames[tonic]) + (minor ? " minor" : " major"); }
     int index() const { return tonic + (minor ? 12 : 0); }
+
+    // Camelot wheel code used by DJs and producers: 1A = Ab minor ... 12A = C# minor, 1B = B major ... 12B = E major
+    juce::String camelot() const
+    {
+        const int start = minor ? 8 : 11;   // Ab minor / B major are number 1
+        return juce::String ((((tonic - start) * 7) % 12 + 12) % 12 + 1) + (minor ? "A" : "B");
+    }
 };
 
 struct Result
 {
-    Key key, altKey;
+    Key key, altKey, thirdKey;
     float keyConfidence = 0.0f;   // 0..1
     double bpm = 0.0, altBpm = 0.0;
     float bpmConfidence = 0.0f;   // 0..1
@@ -438,6 +445,7 @@ namespace detail
         auto keyOf = [&] (int idx) { Key k; k.tonic = idx % 12; k.minor = idx >= 12; k.score = (float) score[(size_t) idx]; return k; };
         r.key = keyOf (order[0]);
         r.altKey = keyOf (order[1]);
+        r.thirdKey = keyOf (order[2]);
 
         // confidence from the gap between the two best keys, calibrated on GiantSteps
         // (tools/calibrate_confidence.py): the shown % matches how often the key is really right
