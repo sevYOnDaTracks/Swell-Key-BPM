@@ -310,32 +310,19 @@ bool parseKey (juce::String s, int& tonic, bool& minor)
     return true;
 }
 
-struct ChromaVariant { int harmonics; float decay, maxHz, threshold, tuningTrust; };
-
-const std::vector<ChromaVariant>& chromaVariants()
-{
-    static const std::vector<ChromaVariant> v {
-        { 4, 0.8f, 3500.0f, 0.05f, 0.15f },   // current engine
-    };
-    return v;
-}
-
-// every chroma variant crossed with every key-scoring setting
+// key decision settings compared on the same chroma (the engine's default chroma)
 std::vector<std::pair<Options, juce::String>> keyConfigs()
 {
     std::vector<std::pair<Options, juce::String>> c;
-    const char* const profNames[] = { "Temperley", "Krumhansl", "Shaath", "Diatonic", "Learned" };
-    for (const auto& cv : chromaVariants())
-        for (int p = 0; p < 5; ++p)
-            for (float bw : { 0.3f, 1.0f })
-                for (float mb : { 0.0f, 0.06f })
-                {
-                    Options o; o.profile = p; o.bassWeight = bw; o.minorBias = mb;
-                    o.harmonics = cv.harmonics; o.harmonicDecay = cv.decay; o.maxHz = cv.maxHz; o.peakThreshold = cv.threshold; o.tuningTrust = cv.tuningTrust;
-                    c.push_back ({ o, "h" + juce::String (cv.harmonics) + "/" + juce::String (cv.decay, 1) + " " + juce::String ((int) cv.maxHz).paddedLeft (' ', 4)
-                                      + "Hz tune " + juce::String (cv.tuningTrust, 2) + "  " + juce::String (profNames[p]).paddedRight (' ', 9)
-                                      + " bass " + juce::String (bw, 1) + " minor+ " + juce::String (mb, 2) });
-                }
+    for (int p : { 3, 4 })
+        for (float tp : { 0.0f, 1.0f, 2.0f })
+            for (float seg : { 0.0f, 10.0f, 20.0f, 40.0f })
+            {
+                Options o; o.profile = p; o.tonalPower = tp; o.segmentSeconds = seg;
+                o.bassWeight = p == 4 ? 1.0f : 0.3f;
+                c.push_back ({ o, juce::String (p == 4 ? "Learned " : "Diatonic") + "  tonal^" + juce::String ((int) tp)
+                                  + "  sections " + (seg > 0.0f ? juce::String ((int) seg).paddedLeft (' ', 2) + " s" : juce::String ("none")) });
+            }
     return c;
 }
 
@@ -394,19 +381,14 @@ int runDataset (const juce::File& audioDir, const juce::File& keyDir, const juce
         {
             std::array<double, 12> upper {}, bass {};
             float tuning = 0.0f;
+            std::vector<detail::FrameChroma> frames;
+            detail::chroma (x, fs, upper, bass, tuning, Options {}, &frames);
+            const double rate = detail::chromaFrameRate (fs);
             ++keyCount;
-            const Options* chromaOf = nullptr;
             for (size_t c = 0; c < configs.size(); ++c)
             {
-                const auto& o = configs[c].first;
-                if (chromaOf == nullptr || o.harmonics != chromaOf->harmonics || o.harmonicDecay != chromaOf->harmonicDecay
-                    || o.maxHz != chromaOf->maxHz || o.peakThreshold != chromaOf->peakThreshold || o.tuningTrust != chromaOf->tuningTrust)
-                {
-                    detail::chroma (x, fs, upper, bass, tuning, o);   // configs are grouped by chroma variant
-                    chromaOf = &o;
-                }
                 Result kr;
-                detail::detectKey (upper, bass, o, kr);
+                detail::detectKeySegments (frames, rate, configs[c].first, kr);
                 const auto e = compareKeys (kr.key, tonic, minor);
                 ++keyStats[c][(size_t) e];
                 mirex[c] += e == KeyError::exact ? 1.0 : e == KeyError::fifth ? 0.5 : e == KeyError::relative ? 0.3 : e == KeyError::parallel ? 0.2 : 0.0;
@@ -414,8 +396,7 @@ int runDataset (const juce::File& audioDir, const juce::File& keyDir, const juce
             if (verbose)
             {
                 Result kr;
-                detail::chroma (x, fs, upper, bass, tuning, Options {});
-                detail::detectKey (upper, bass, Options {}, kr);
+                detail::detectKeySegments (frames, rate, Options {}, kr);
                 if (compareKeys (kr.key, tonic, minor) != KeyError::exact)
                 {
                     Key t; t.tonic = tonic; t.minor = minor;
@@ -435,13 +416,12 @@ int runDataset (const juce::File& audioDir, const juce::File& keyDir, const juce
                   << "   within 1 BPM: " << juce::roundToInt (100.0 * ourExact / bpmCount) << " %\n";
     if (keyCount > 0)
     {
-        std::cout << "KEY    " << keyCount << " files  (15 best settings by MIREX score, then the current engine)\n"
+        std::cout << "KEY    " << keyCount << " files  (12 best settings by MIREX score)\n"
                   << juce::String().paddedRight (' ', 62) << "exact  MIREX  same notes   relative  fifth  parallel  other\n";
         std::vector<size_t> order (configs.size());
         std::iota (order.begin(), order.end(), (size_t) 0);
         std::sort (order.begin(), order.end(), [&] (size_t a, size_t b) { return mirex[a] > mirex[b]; });
-        order.resize (juce::jmin ((size_t) 15, order.size()));
-        order.push_back (0);
+        order.resize (juce::jmin ((size_t) 12, order.size()));
         for (size_t c : order)
         {
             const auto& k = keyStats[c];

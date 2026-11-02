@@ -44,6 +44,10 @@ struct Options
     float harmonicDecay = 0.8f;   // weight of harmonic h = decay^(h-1)
     float peakThreshold = 0.05f;  // peaks below this fraction of the frame's loudest are ignored
     float tuningTrust = 0.15f;    // peak agreement needed before moving away from A = 440 (higher = stricter)
+
+    // key decision
+    float tonalPower = 0.0f;      // frames weighted by tonalness^power (0 = every frame equal)
+    float segmentSeconds = 0.0f;  // > 0: sections of this length vote on the key (0 = whole track at once)
 };
 
 //==============================================================================
@@ -227,14 +231,45 @@ namespace detail
     }
 
     //==========================================================================
-    // Chroma from spectral peaks, tuning-corrected; bass (< 250 Hz) and upper range kept apart
+    // One analysis frame's chroma (each normalised to sum 1) and how clearly tonal the frame is
+    struct FrameChroma
+    {
+        std::array<double, 12> upper {}, bass {};
+        float tonal = 0.0f;   // share of the spectrum's energy that sits in clear peaks (low on drum-only frames)
+    };
+
+    constexpr double chromaFrameRate (double fs) { return fs / 4096.0; }   // N / 4 hop below
+
+    // Weighted sum of a range of frames
+    inline void aggregate (const std::vector<FrameChroma>& frames, size_t from, size_t to, float tonalPower,
+                           std::array<double, 12>& upper, std::array<double, 12>& bass, double& weight)
+    {
+        upper.fill (0.0);
+        bass.fill (0.0);
+        weight = 0.0;
+        for (size_t f = from; f < to && f < frames.size(); ++f)
+        {
+            const double w = tonalPower > 0.0f ? std::pow ((double) frames[f].tonal, (double) tonalPower) : 1.0;
+            for (int i = 0; i < 12; ++i)
+            {
+                upper[(size_t) i] += frames[f].upper[(size_t) i] * w;
+                bass[(size_t) i] += frames[f].bass[(size_t) i] * w;
+            }
+            weight += w;
+        }
+    }
+
+    // Chroma from spectral peaks, tuning-corrected; bass (< 250 Hz) and upper range kept apart.
+    // Fills the whole-track chroma, and every frame's chroma when framesOut is given.
     inline void chroma (const std::vector<float>& x, double fs, std::array<double, 12>& upper, std::array<double, 12>& bass, float& tuning,
-                        const Options& opt = {})
+                        const Options& opt = {}, std::vector<FrameChroma>* framesOut = nullptr)
     {
         constexpr int order = 14, N = 1 << order, H = N / 4;
         upper.fill (0.0);
         bass.fill (0.0);
         tuning = 0.0f;
+        if (framesOut != nullptr)
+            framesOut->clear();
         if ((int) x.size() < N)
             return;
 
@@ -247,7 +282,7 @@ namespace detail
 
         struct Peak { float midi, weight; };
         std::vector<std::vector<Peak>> peaks ((size_t) frames);
-        std::vector<float> energy ((size_t) frames, 0.0f);
+        std::vector<float> energy ((size_t) frames, 0.0f), tonal ((size_t) frames, 0.0f);
 
         for (int f = 0; f < frames; ++f)
         {
@@ -256,9 +291,12 @@ namespace detail
                 buf[(size_t) i] = x[(size_t) (f * H + i)] * win[(size_t) i];
             fft.performFrequencyOnlyForwardTransform (buf.data(), true);
 
-            float maxMag = 0.0f;
+            float maxMag = 0.0f, sumMag = 0.0f, peakMag = 0.0f;
             for (int k = lo; k <= hi; ++k)
+            {
                 maxMag = juce::jmax (maxMag, buf[(size_t) k]);
+                sumMag += buf[(size_t) k];
+            }
             energy[(size_t) f] = maxMag;
             if (maxMag <= 0.0f)
                 continue;
@@ -268,6 +306,7 @@ namespace detail
                 const float m = buf[(size_t) k];
                 if (m < maxMag * opt.peakThreshold || m <= buf[(size_t) k - 1] || m < buf[(size_t) k + 1])
                     continue;
+                peakMag += m + buf[(size_t) k - 1] + buf[(size_t) k + 1];
                 // parabolic interpolation of the peak frequency
                 const float a = std::log (buf[(size_t) k - 1] + 1e-9f), b = std::log (m + 1e-9f), c = std::log (buf[(size_t) k + 1] + 1e-9f);
                 const float denom = a - 2.0f * b + c;
@@ -275,6 +314,7 @@ namespace detail
                 const double hz = (k + juce::jlimit (-0.5f, 0.5f, d)) * binHz;
                 peaks[(size_t) f].push_back ({ (float) (69.0 + 12.0 * std::log2 (hz / 440.0)), std::sqrt (m / maxMag) });
             }
+            tonal[(size_t) f] = sumMag > 0.0f ? juce::jmin (1.0f, peakMag / sumMag) : 0.0f;
         }
 
         // tuning: weighted circular mean of the strong tonal peaks' offset from the 12-TET grid
@@ -294,8 +334,10 @@ namespace detail
         tuning = (float) (std::atan2 (sn, cs) / juce::MathConstants<double>::twoPi
                           * juce::jlimit (0.0, 1.0, (concentration - opt.tuningTrust) / 0.25));
 
-        // quiet frames (intros, breaks) count less; each loud frame votes about equally
+        // quiet frames (intros, breaks) are left out; each other frame gets a normalised chroma
         const float loud = *std::max_element (energy.begin(), energy.end());
+        std::vector<FrameChroma> local;
+        auto& out = framesOut != nullptr ? *framesOut : local;
         for (int f = 0; f < frames; ++f)
         {
             if (energy[(size_t) f] < loud * 0.05f)
@@ -322,12 +364,18 @@ namespace detail
                 }
             }
             const double su = std::accumulate (u.begin(), u.end(), 0.0), sb = std::accumulate (bs.begin(), bs.end(), 0.0);
+            FrameChroma fc;
+            fc.tonal = tonal[(size_t) f];
             for (int i = 0; i < 12; ++i)
             {
-                if (su > 0.0) upper[(size_t) i] += u[(size_t) i] / su;
-                if (sb > 0.0) bass[(size_t) i] += bs[(size_t) i] / sb;
+                if (su > 0.0) fc.upper[(size_t) i] = u[(size_t) i] / su;
+                if (sb > 0.0) fc.bass[(size_t) i] = bs[(size_t) i] / sb;
             }
+            out.push_back (fc);
         }
+
+        double weight = 0.0;
+        aggregate (out, 0, out.size(), opt.tonalPower, upper, bass, weight);
     }
 
     inline double correlation (const std::array<double, 12>& x, const float* profile, int tonic)
@@ -344,7 +392,8 @@ namespace detail
         return sxx > 0.0 && syy > 0.0 ? sxy / std::sqrt (sxx * syy) : 0.0;
     }
 
-    inline void detectKey (const std::array<double, 12>& upper, const std::array<double, 12>& bass, const Options& opt, Result& r)
+    // Score of each of the 24 keys (0-11 major, 12-23 minor) for one chroma
+    inline std::array<double, 24> scoreKeys (const std::array<double, 12>& upper, const std::array<double, 12>& bass, const Options& opt)
     {
         const auto& prof = profiles()[(size_t) juce::jlimit (0, (int) profiles().size() - 1, opt.profile)];
 
@@ -376,7 +425,12 @@ namespace detail
             score[(size_t) t]      = correlation (mix, prof.major, t) + bassOnTonic;
             score[(size_t) t + 12] = correlation (mix, prof.minor, t) + bassOnTonic + opt.minorBias;
         }
+        return score;
+    }
 
+    // Best key, runner-up and confidence from the 24 scores
+    inline void pickKey (const std::array<double, 24>& score, Result& r)
+    {
         std::array<int, 24> order {};
         std::iota (order.begin(), order.end(), 0);
         std::sort (order.begin(), order.end(), [&] (int a, int c) { return score[(size_t) a] > score[(size_t) c]; });
@@ -385,9 +439,48 @@ namespace detail
         r.key = keyOf (order[0]);
         r.altKey = keyOf (order[1]);
 
-        // confidence from the gap between the two best keys
+        // confidence from the gap between the two best keys, calibrated on GiantSteps
+        // (tools/calibrate_confidence.py): the shown % matches how often the key is really right
         const double gap = score[(size_t) order[0]] - score[(size_t) order[1]];
-        r.keyConfidence = (float) juce::jlimit (0.0, 1.0, 0.5 + gap * 4.0);
+        r.keyConfidence = (float) (1.0 / (1.0 + std::exp (-(5.581 * gap - 0.912))));
+    }
+
+    inline void detectKey (const std::array<double, 12>& upper, const std::array<double, 12>& bass, const Options& opt, Result& r)
+    {
+        pickKey (scoreKeys (upper, bass, opt), r);
+    }
+
+    // Segment voting: every section of the track scores the keys on its own chroma, the scores
+    // are added up weighted by how much tonal material the section holds
+    inline void detectKeySegments (const std::vector<FrameChroma>& frames, double frameRate, const Options& opt, Result& r)
+    {
+        if (opt.segmentSeconds <= 0.0f || frames.empty())
+        {
+            std::array<double, 12> u {}, b {};
+            double w = 0.0;
+            aggregate (frames, 0, frames.size(), opt.tonalPower, u, b, w);
+            pickKey (scoreKeys (u, b, opt), r);
+            return;
+        }
+
+        const auto len = (size_t) juce::jmax (1, (int) std::round (opt.segmentSeconds * frameRate));
+        std::array<double, 24> total {};
+        double totalWeight = 0.0;
+        for (size_t from = 0; from < frames.size(); from += len)
+        {
+            std::array<double, 12> u {}, b {};
+            double w = 0.0;
+            aggregate (frames, from, from + len, opt.tonalPower, u, b, w);
+            if (w <= 0.0)
+                continue;
+            const auto s = scoreKeys (u, b, opt);
+            for (size_t k = 0; k < 24; ++k)
+                total[k] += s[k] * w;
+            totalWeight += w;
+        }
+        if (totalWeight > 0.0)
+            for (auto& s : total) s /= totalWeight;
+        pickKey (total, r);
     }
 } // namespace detail
 
@@ -404,9 +497,10 @@ inline Result analyse (const juce::AudioBuffer<float>& audio, double sampleRate,
 
     std::array<double, 12> upper {}, bass {};
     float tuning = 0.0f;
-    detail::chroma (x, fs, upper, bass, tuning, opt);
+    std::vector<detail::FrameChroma> frames;
+    detail::chroma (x, fs, upper, bass, tuning, opt, &frames);
     r.tuningCents = tuning * 100.0f;
-    detail::detectKey (upper, bass, opt, r);
+    detail::detectKeySegments (frames, detail::chromaFrameRate (fs), opt, r);
     return r;
 }
 } // namespace SwellKey
