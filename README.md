@@ -6,7 +6,7 @@
 
 <p align="center">
   La gamme et le BPM de n'importe quelle prod en une seconde — <b>Standalone</b>, <b>VST3</b> (Windows / Mac) et <b>AU</b> (Mac)<br>
-  par <b>Swell</b> · <a href="https://github.com/sevYOnDaTracks">@sevyondatracks</a>
+  par <b>Swell-audio</b> · <a href="https://github.com/sevYOnDaTracks">@sevyondatracks</a>
 </p>
 
 ---
