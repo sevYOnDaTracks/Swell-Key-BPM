@@ -1,0 +1,6 @@
+build/
+build-mac/
+.vscode/
+.DS_Store
+build-log.txt
+build-log.txt
