@@ -32,11 +32,18 @@ struct Result
 
 struct Options
 {
-    int profile = 3;              // see profiles()
-    float bassWeight = 0.5f;      // bass chroma mixed into the key chroma
+    int profile = 4;              // see profiles()
+    float bassWeight = 1.0f;      // bass chroma mixed into the key chroma (learned profile: weight of the bass match)
     float tonicBonus = 0.0f;      // weight of the bass on the tonic
-    float minorBias = 0.05f;      // most rap / trap beats are minor: favour minor over its relative major
+    float minorBias = 0.06f;      // most rap / trap beats are minor: favour minor over its relative major
     float tonicPresence = 0.0f;   // penalty for a key whose tonic the bass (almost) never plays
+
+    // chroma
+    float maxHz = 3500.0f;        // highest frequency used for the key
+    int harmonics = 4;            // credit each peak to the fundamentals it could be harmonic 1..n of
+    float harmonicDecay = 0.8f;   // weight of harmonic h = decay^(h-1)
+    float peakThreshold = 0.05f;  // peaks below this fraction of the frame's loudest are ignored
+    float tuningTrust = 0.15f;    // peak agreement needed before moving away from A = 440 (higher = stricter)
 };
 
 //==============================================================================
@@ -59,7 +66,19 @@ namespace detail
             // 3: diatonic (flat scale tones, tonic and fifth stressed)
             { { 2.0f, 0.0f, 1.0f, 0.0f, 1.2f, 1.0f, 0.0f, 1.5f, 0.0f, 1.0f, 0.0f, 1.0f },
               { 2.0f, 0.0f, 1.0f, 1.2f, 0.0f, 1.0f, 0.0f, 1.5f, 1.0f, 0.0f, 1.0f, 0.3f } },
+            // 4: learned from the GiantSteps key dataset (upper range; see tools/learn_profiles.py)
+            { { 0.1453f, 0.0378f, 0.1063f, 0.0496f, 0.1196f, 0.0732f, 0.0479f, 0.1490f, 0.0434f, 0.0894f, 0.0573f, 0.0812f },
+              { 0.1477f, 0.0475f, 0.0947f, 0.0964f, 0.0620f, 0.0847f, 0.0451f, 0.1534f, 0.0617f, 0.0558f, 0.0980f, 0.0531f } },
         };
+        return p;
+    }
+
+    // Bass-range profiles learned alongside profile 4, matched separately against the bass chroma
+    inline const Profile& learnedBassProfile()
+    {
+        static const Profile p {
+            { 0.1378f, 0.0553f, 0.0889f, 0.0625f, 0.0927f, 0.1007f, 0.0570f, 0.1212f, 0.0582f, 0.0863f, 0.0668f, 0.0727f },
+            { 0.1361f, 0.0684f, 0.0770f, 0.0963f, 0.0690f, 0.0959f, 0.0609f, 0.1055f, 0.0791f, 0.0625f, 0.0855f, 0.0639f } };
         return p;
     }
 
@@ -209,7 +228,8 @@ namespace detail
 
     //==========================================================================
     // Chroma from spectral peaks, tuning-corrected; bass (< 250 Hz) and upper range kept apart
-    inline void chroma (const std::vector<float>& x, double fs, std::array<double, 12>& upper, std::array<double, 12>& bass, float& tuning)
+    inline void chroma (const std::vector<float>& x, double fs, std::array<double, 12>& upper, std::array<double, 12>& bass, float& tuning,
+                        const Options& opt = {})
     {
         constexpr int order = 14, N = 1 << order, H = N / 4;
         upper.fill (0.0);
@@ -222,7 +242,7 @@ namespace detail
         const auto win = hann (N);
         std::vector<float> buf ((size_t) N * 2);
         const double binHz = fs / N;
-        const int lo = (int) (45.0 / binHz), hi = juce::jmin (N / 2 - 2, (int) (5000.0 / binHz));
+        const int lo = (int) (45.0 / binHz), hi = juce::jmin (N / 2 - 2, (int) (opt.maxHz / binHz));
         const int frames = ((int) x.size() - N) / H + 1;
 
         struct Peak { float midi, weight; };
@@ -246,7 +266,7 @@ namespace detail
             for (int k = lo; k <= hi; ++k)
             {
                 const float m = buf[(size_t) k];
-                if (m < maxMag * 0.01f || m <= buf[(size_t) k - 1] || m < buf[(size_t) k + 1])
+                if (m < maxMag * opt.peakThreshold || m <= buf[(size_t) k - 1] || m < buf[(size_t) k + 1])
                     continue;
                 // parabolic interpolation of the peak frequency
                 const float a = std::log (buf[(size_t) k - 1] + 1e-9f), b = std::log (m + 1e-9f), c = std::log (buf[(size_t) k + 1] + 1e-9f);
@@ -257,16 +277,22 @@ namespace detail
             }
         }
 
-        // tuning: weighted circular mean of the peaks' offset from the 12-TET grid
-        double cs = 0.0, sn = 0.0;
+        // tuning: weighted circular mean of the strong tonal peaks' offset from the 12-TET grid
+        // (80 Hz - 1.5 kHz, drums and noise left out); stays at A = 440 unless the evidence is clear
+        double cs = 0.0, sn = 0.0, total = 0.0;
         for (auto& fp : peaks)
             for (auto& p : fp)
             {
+                if (p.weight < 0.4f || p.midi < 39.5f || p.midi > 90.5f)
+                    continue;
                 const double ang = juce::MathConstants<double>::twoPi * p.midi;
                 cs += p.weight * std::cos (ang);
                 sn += p.weight * std::sin (ang);
+                total += p.weight;
             }
-        tuning = (float) (std::atan2 (sn, cs) / juce::MathConstants<double>::twoPi);
+        const double concentration = total > 0.0 ? std::sqrt (cs * cs + sn * sn) / total : 0.0;
+        tuning = (float) (std::atan2 (sn, cs) / juce::MathConstants<double>::twoPi
+                          * juce::jlimit (0.0, 1.0, (concentration - opt.tuningTrust) / 0.25));
 
         // quiet frames (intros, breaks) count less; each loud frame votes about equally
         const float loud = *std::max_element (energy.begin(), energy.end());
@@ -282,8 +308,18 @@ namespace detail
                 if (std::abs (dev) > 0.35f)
                     continue;
                 const double w = p.weight * std::pow (std::cos (juce::MathConstants<float>::pi * dev), 2.0f);
-                const int pc = ((int) std::round (m) % 12 + 12) % 12;
-                (m < 59.0f ? bs : u)[(size_t) pc] += w;   // MIDI 59 ~ 247 Hz
+                (m < 59.0f ? bs : u)[(size_t) ((((int) std::round (m)) % 12 + 12) % 12)] += w;   // MIDI 59 ~ 247 Hz
+
+                // this peak may also be harmonic h of a lower note: credit that fundamental too
+                for (int h = 2; h <= opt.harmonics; ++h)
+                {
+                    const float fm = m - 12.0f * std::log2 ((float) h);
+                    const float fdev = fm - std::round (fm);
+                    if (std::abs (fdev) > 0.35f || fm < 28.0f)
+                        continue;
+                    const double hw = w * std::pow (opt.harmonicDecay, (double) (h - 1));
+                    (fm < 59.0f ? bs : u)[(size_t) ((((int) std::round (fm)) % 12 + 12) % 12)] += hw;
+                }
             }
             const double su = std::accumulate (u.begin(), u.end(), 0.0), sb = std::accumulate (bs.begin(), bs.end(), 0.0);
             for (int i = 0; i < 12; ++i)
@@ -324,8 +360,17 @@ namespace detail
             mix[(size_t) i] = u[(size_t) i] + opt.bassWeight * b[(size_t) i];
 
         std::array<double, 24> score {};
+        const bool learned = opt.profile == 4;
         for (int t = 0; t < 12; ++t)
         {
+            if (learned)
+            {
+                // learned profiles: upper and bass chroma each matched against their own profile
+                const auto& bp = learnedBassProfile();
+                score[(size_t) t]      = correlation (u, prof.major, t) + opt.bassWeight * correlation (b, bp.major, t);
+                score[(size_t) t + 12] = correlation (u, prof.minor, t) + opt.bassWeight * correlation (b, bp.minor, t) + opt.minorBias;
+                continue;
+            }
             const double bassOnTonic = opt.tonicBonus * 12.0 * (b[(size_t) t] - 1.0 / 12.0)
                                      - opt.tonicPresence * (1.0 - juce::jlimit (0.0, 1.0, b[(size_t) t] / 0.15));
             score[(size_t) t]      = correlation (mix, prof.major, t) + bassOnTonic;
@@ -359,7 +404,7 @@ inline Result analyse (const juce::AudioBuffer<float>& audio, double sampleRate,
 
     std::array<double, 12> upper {}, bass {};
     float tuning = 0.0f;
-    detail::chroma (x, fs, upper, bass, tuning);
+    detail::chroma (x, fs, upper, bass, tuning, opt);
     r.tuningCents = tuning * 100.0f;
     detail::detectKey (upper, bass, opt, r);
     return r;

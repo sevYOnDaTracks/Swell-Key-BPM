@@ -1,6 +1,8 @@
 // Swell Key test bench.
 //   SwellKeyBench analyse <file> [file...]   key + BPM of real files
 //   SwellKeyBench synth <count> [seed]        score the engine on generated beats with known key/BPM
+//   SwellKeyBench dataset <audio> <keys|-> <bpms|->   score on an annotated dataset (GiantSteps layout)
+//   SwellKeyBench features <audio> <keys> <out.csv>   export chroma features for profile learning
 
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "../Source/KeyEngine.h"
@@ -287,6 +289,218 @@ int runSynth (int count, int seed)
     return 0;
 }
 
+//==============================================================================
+// Annotated datasets (GiantSteps layout: audio/<id>.mp3, <id>.key = "C minor", <id>.bpm = "127.0")
+bool parseKey (juce::String s, int& tonic, bool& minor)
+{
+    s = s.trim().toLowerCase();
+    if (s.isEmpty()) return false;
+    static const int base[] = { 9, 11, 0, 2, 4, 5, 7 };   // a b c d e f g
+    const juce::juce_wchar letter = s[0];
+    if (letter < 'a' || letter > 'g') return false;
+    tonic = base[letter - 'a'];
+    int i = 1;
+    if (s[i] == '#') { ++tonic; ++i; }
+    else if (s[i] == 'b' && s.length() > 2 && s[i + 1] != 'a') { --tonic; ++i; }   // "b" flat, not "bass"
+    tonic = (tonic + 12) % 12;
+    const auto rest = s.substring (i).trim();
+    if (rest.startsWith ("min") || rest == "m") minor = true;
+    else if (rest.startsWith ("maj") || rest.isEmpty()) minor = false;
+    else return false;
+    return true;
+}
+
+struct ChromaVariant { int harmonics; float decay, maxHz, threshold, tuningTrust; };
+
+const std::vector<ChromaVariant>& chromaVariants()
+{
+    static const std::vector<ChromaVariant> v {
+        { 4, 0.8f, 3500.0f, 0.05f, 0.15f },   // current engine
+    };
+    return v;
+}
+
+// every chroma variant crossed with every key-scoring setting
+std::vector<std::pair<Options, juce::String>> keyConfigs()
+{
+    std::vector<std::pair<Options, juce::String>> c;
+    const char* const profNames[] = { "Temperley", "Krumhansl", "Shaath", "Diatonic", "Learned" };
+    for (const auto& cv : chromaVariants())
+        for (int p = 0; p < 5; ++p)
+            for (float bw : { 0.3f, 1.0f })
+                for (float mb : { 0.0f, 0.06f })
+                {
+                    Options o; o.profile = p; o.bassWeight = bw; o.minorBias = mb;
+                    o.harmonics = cv.harmonics; o.harmonicDecay = cv.decay; o.maxHz = cv.maxHz; o.peakThreshold = cv.threshold; o.tuningTrust = cv.tuningTrust;
+                    c.push_back ({ o, "h" + juce::String (cv.harmonics) + "/" + juce::String (cv.decay, 1) + " " + juce::String ((int) cv.maxHz).paddedLeft (' ', 4)
+                                      + "Hz tune " + juce::String (cv.tuningTrust, 2) + "  " + juce::String (profNames[p]).paddedRight (' ', 9)
+                                      + " bass " + juce::String (bw, 1) + " minor+ " + juce::String (mb, 2) });
+                }
+    return c;
+}
+
+int runDataset (const juce::File& audioDir, const juce::File& keyDir, const juce::File& bpmDir)
+{
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
+    const bool verbose = juce::SystemStats::getEnvironmentVariable ("SWELL_VERBOSE", {}).isNotEmpty();
+    const auto configs = keyConfigs();
+
+    std::vector<std::array<int, 5>> keyStats (configs.size(), std::array<int, 5> {});
+    std::vector<double> mirex (configs.size(), 0.0);
+    int keyCount = 0, bpmCount = 0, acc1 = 0, acc2 = 0, ourExact = 0;
+    double msTotal = 0.0;
+
+    auto files = audioDir.findChildFiles (juce::File::findFiles, false, "*.mp3;*.wav;*.flac;*.aif;*.aiff");
+    files.sort();
+    for (const auto& f : files)
+    {
+        const auto id = f.getFileNameWithoutExtension();
+        int tonic = 0; bool minor = false;
+        const auto keyFile = keyDir.getChildFile (id + ".key");
+        const bool hasKey = keyDir.isDirectory() && keyFile.existsAsFile() && parseKey (keyFile.loadFileAsString(), tonic, minor);
+        const auto bpmFile = bpmDir.getChildFile (id + ".bpm");
+        const double bpmTruth = bpmDir.isDirectory() && bpmFile.existsAsFile() ? bpmFile.loadFileAsString().trim().getDoubleValue() : 0.0;
+        if (! hasKey && bpmTruth <= 0.0)
+            continue;
+
+        std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (f));
+        if (reader == nullptr) { std::cout << "cannot read " << f.getFileName() << "\n"; continue; }
+        juce::AudioBuffer<float> buf ((int) reader->numChannels, (int) reader->lengthInSamples);
+        reader->read (&buf, 0, buf.getNumSamples(), 0, true, true);
+
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        double fs = 0.0, frameRate = 0.0;
+        const auto x = detail::prepare (buf, reader->sampleRate, fs);
+
+        if (bpmTruth > 0.0)
+        {
+            Result r;
+            const auto onsets = detail::onsetEnvelope (x, fs, frameRate);
+            detail::detectTempo (onsets, frameRate, r);
+            ++bpmCount;
+            const bool a1 = std::abs (r.bpm - bpmTruth) <= 0.04 * bpmTruth;
+            bool a2 = a1;
+            for (double m : { 2.0, 0.5, 3.0, 1.0 / 3.0 })
+                a2 = a2 || std::abs (r.bpm * m - bpmTruth) <= 0.04 * bpmTruth;
+            acc1 += a1 ? 1 : 0;
+            acc2 += a2 ? 1 : 0;
+            ourExact += std::abs (r.bpm - bpmTruth) <= 1.0 ? 1 : 0;
+            if (verbose && ! a1)
+                std::cout << "  bpm  " << id << "  " << bpmTruth << " -> " << r.bpm << " (alt " << r.altBpm << ")\n";
+        }
+
+        if (hasKey)
+        {
+            std::array<double, 12> upper {}, bass {};
+            float tuning = 0.0f;
+            ++keyCount;
+            const Options* chromaOf = nullptr;
+            for (size_t c = 0; c < configs.size(); ++c)
+            {
+                const auto& o = configs[c].first;
+                if (chromaOf == nullptr || o.harmonics != chromaOf->harmonics || o.harmonicDecay != chromaOf->harmonicDecay
+                    || o.maxHz != chromaOf->maxHz || o.peakThreshold != chromaOf->peakThreshold || o.tuningTrust != chromaOf->tuningTrust)
+                {
+                    detail::chroma (x, fs, upper, bass, tuning, o);   // configs are grouped by chroma variant
+                    chromaOf = &o;
+                }
+                Result kr;
+                detail::detectKey (upper, bass, o, kr);
+                const auto e = compareKeys (kr.key, tonic, minor);
+                ++keyStats[c][(size_t) e];
+                mirex[c] += e == KeyError::exact ? 1.0 : e == KeyError::fifth ? 0.5 : e == KeyError::relative ? 0.3 : e == KeyError::parallel ? 0.2 : 0.0;
+            }
+            if (verbose)
+            {
+                Result kr;
+                detail::chroma (x, fs, upper, bass, tuning, Options {});
+                detail::detectKey (upper, bass, Options {}, kr);
+                if (compareKeys (kr.key, tonic, minor) != KeyError::exact)
+                {
+                    Key t; t.tonic = tonic; t.minor = minor;
+                    std::cout << "  key  " << id << "  " << t.name() << " -> " << kr.key.name()
+                              << "  [+" << ((kr.key.tonic - tonic + 12) % 12) << " st]  (alt " << kr.altKey.name()
+                              << ", " << juce::roundToInt (kr.keyConfidence * 100) << " %, tuning " << juce::roundToInt (tuning * 100) << ")\n";
+                }
+            }
+        }
+        msTotal += juce::Time::getMillisecondCounterHiRes() - t0;
+    }
+
+    std::cout << "\n=== " << audioDir.getParentDirectory().getFileName() << " ===\n";
+    if (bpmCount > 0)
+        std::cout << "TEMPO  " << bpmCount << " files   Accuracy1 (4 %): " << juce::roundToInt (100.0 * acc1 / bpmCount) << " %"
+                  << "   Accuracy2 (x2, x3): " << juce::roundToInt (100.0 * acc2 / bpmCount) << " %"
+                  << "   within 1 BPM: " << juce::roundToInt (100.0 * ourExact / bpmCount) << " %\n";
+    if (keyCount > 0)
+    {
+        std::cout << "KEY    " << keyCount << " files  (15 best settings by MIREX score, then the current engine)\n"
+                  << juce::String().paddedRight (' ', 62) << "exact  MIREX  same notes   relative  fifth  parallel  other\n";
+        std::vector<size_t> order (configs.size());
+        std::iota (order.begin(), order.end(), (size_t) 0);
+        std::sort (order.begin(), order.end(), [&] (size_t a, size_t b) { return mirex[a] > mirex[b]; });
+        order.resize (juce::jmin ((size_t) 15, order.size()));
+        order.push_back (0);
+        for (size_t c : order)
+        {
+            const auto& k = keyStats[c];
+            std::cout << configs[c].second << "   "
+                      << juce::String (juce::roundToInt (100.0 * k[0] / keyCount)).paddedLeft (' ', 4) << " %"
+                      << juce::String (juce::roundToInt (100.0 * mirex[c] / keyCount)).paddedLeft (' ', 5) << " %"
+                      << juce::String (juce::roundToInt (100.0 * (k[0] + k[1]) / keyCount)).paddedLeft (' ', 9) << " %"
+                      << juce::String (k[1]).paddedLeft (' ', 9) << juce::String (k[2]).paddedLeft (' ', 7)
+                      << juce::String (k[3]).paddedLeft (' ', 9) << juce::String (k[4]).paddedLeft (' ', 7) << "\n";
+        }
+    }
+    const int n = juce::jmax (bpmCount, keyCount);
+    if (n > 0)
+        std::cout << "average analysis time: " << juce::roundToInt (msTotal / n) << " ms per file\n";
+    return 0;
+}
+
+// Writes one CSV row per annotated file: id, tonic, minor, 12 upper chroma, 12 bass chroma, tuning
+int runFeatures (const juce::File& audioDir, const juce::File& keyDir, const juce::File& outFile)
+{
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
+    outFile.deleteFile();
+    juce::FileOutputStream out (outFile);
+    if (! out.openedOk()) { std::cerr << "cannot write " << outFile.getFullPathName() << "\n"; return 1; }
+
+    auto files = audioDir.findChildFiles (juce::File::findFiles, false, "*.mp3;*.wav;*.flac;*.aif;*.aiff");
+    files.sort();
+    int n = 0;
+    for (const auto& f : files)
+    {
+        const auto id = f.getFileNameWithoutExtension();
+        int tonic = 0; bool minor = false;
+        const auto keyFile = keyDir.getChildFile (id + ".key");
+        if (! keyFile.existsAsFile() || ! parseKey (keyFile.loadFileAsString(), tonic, minor))
+            continue;
+        std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (f));
+        if (reader == nullptr) continue;
+        juce::AudioBuffer<float> buf ((int) reader->numChannels, (int) reader->lengthInSamples);
+        reader->read (&buf, 0, buf.getNumSamples(), 0, true, true);
+
+        double fs = 0.0;
+        const auto x = detail::prepare (buf, reader->sampleRate, fs);
+        std::array<double, 12> upper {}, bass {};
+        float tuning = 0.0f;
+        detail::chroma (x, fs, upper, bass, tuning, Options {});
+
+        juce::String row;
+        row << id << "," << tonic << "," << (minor ? 1 : 0);
+        for (auto v : upper) row << "," << v;
+        for (auto v : bass) row << "," << v;
+        row << "," << tuning << "\n";
+        out.writeText (row, false, false, nullptr);
+        ++n;
+    }
+    std::cout << n << " files written to " << outFile.getFullPathName() << "\n";
+    return 0;
+}
+
 std::unique_ptr<juce::AudioFormatReader> openAudio (juce::AudioFormatManager& fm, const juce::File& f)
 {
     return std::unique_ptr<juce::AudioFormatReader> (fm.createReaderFor (f));
@@ -316,6 +530,16 @@ int main (int argc, char* argv[])
     const juce::String mode (argv[1]);
     if (mode == "synth")
         return runSynth (argc > 2 ? juce::String (argv[2]).getIntValue() : 100, argc > 3 ? juce::String (argv[3]).getIntValue() : 1);
+
+    if (mode == "dataset" && argc > 4)
+    {
+        auto dir = [] (const char* p) { return juce::String (p) == "-" ? juce::File() : juce::File (juce::String::fromUTF8 (p)); };
+        return runDataset (dir (argv[2]), dir (argv[3]), dir (argv[4]));
+    }
+
+    if (mode == "features" && argc > 4)
+        return runFeatures (juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])),
+                            juce::File (juce::String::fromUTF8 (argv[4])));
 
     if (mode == "analyse")
     {
