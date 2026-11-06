@@ -508,7 +508,7 @@ void SwellKeyEditor::paint (juce::Graphics& g)
     g.setFont (swellFont (12.0f));
     g.drawText (juce::String::fromUTF8 ("SWELL Key  \xc2\xb7  v") + JucePlugin_VersionString, 20, 586, 300, 34, juce::Justification::centredLeft);
     drawSwellLogo (g, { (float) getWidth() - 40.0f, 594.0f, 20.0f, 18.0f });
-    g.drawText ("by @sevyondatracks", getWidth() - 250, 586, 202, 34, juce::Justification::centredRight);
+    g.drawText ("v" JucePlugin_VersionString "  /  by @sevyondatracks", getWidth() - 250, 586, 202, 34, juce::Justification::centredRight);
 }
 
 void SwellKeyEditor::paintBusy (juce::Graphics& g)

@@ -1,0 +1,39 @@
+name: Build Swell Key
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64 
+      - name: Configure universal Mac
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release 
+      - run: cmake --build build --config Release --parallel 3
+      - name: Package macOS bundles with executable permissions
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p package
+          cd build/SwellKey_artefacts/Release
+          ditto -c -k --keepParent VST3 ../../../package/Swell-Key-macOS-VST3.zip
+          ditto -c -k --keepParent AU ../../../package/Swell-Key-macOS-AU.zip
+          ditto -c -k --keepParent Standalone ../../../package/Swell-Key-macOS-Standalone.zip
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package -Force
+          Compress-Archive -Path 'build/SwellKey_artefacts/Release/VST3/*.vst3', 'build/SwellKey_artefacts/Release/Standalone/*.exe' -DestinationPath 'package/Swell-Key-Windows.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Swell-Key-${{ runner.os }}
+          path: package/*.zip
+          if-no-files-found: error

@@ -1,3 +1,4 @@
+#include "ResizableEditor.h"
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "SwellLink.h"
@@ -266,7 +267,7 @@ bool SwellKeyProcessor::getListenResult (SwellKey::Result& out) const
 
 juce::AudioProcessorEditor* SwellKeyProcessor::createEditor()
 {
-    return new SwellKeyEditor (*this);
+    return new ResizableEditor(*this, new SwellKeyEditor(*this));
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
